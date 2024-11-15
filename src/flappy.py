@@ -6,7 +6,9 @@ from pygame.locals import K_ESCAPE, K_SPACE, K_UP, KEYDOWN, QUIT
 from prometheus_client import Gauge, start_http_server  # Import Prometheus client
 import aiohttp  # Async HTTP client for network requests
 import psutil  # To measure bandwidth usage
-import boto3
+import boto3  # (Assuming this is used elsewhere in the game)
+
+
 
 from .entities import (
     Background,
@@ -27,6 +29,7 @@ class Flappy:
         window = Window(288, 512)
         screen = pygame.display.set_mode((window.width, window.height))
         images = Images()
+        self.lambda_client = boto3.client('lambda')  # AWS Lambda client
 
         self.config = GameConfig(
             screen=screen,
@@ -37,8 +40,9 @@ class Flappy:
             sounds=Sounds(),
         )
 
-        # Initialize the font for the FPS display
+        # Initialize the font for the FPS display and player name
         self.font = pygame.font.SysFont('Arial', 20)
+        self.player_name = "Player"  # Default name
 
         # Initialize Prometheus Gauges for FPS, Network Latency, and Bandwidth Usage
         self.fps_metric = Gauge('flappybird_fps', 'Frames Per Second of FlappyBird')
@@ -56,7 +60,58 @@ class Flappy:
         self.last_bytes_sent = 0
         self.last_bandwidth_check = time.time()
 
+    async def get_player_name(self):
+        """Display a text input field to get the player's name."""
+        input_active = True
+        player_name = ""
+        input_box = pygame.Rect(50, 200, 200, 30)  # Rect for input box
+        color_inactive = pygame.Color('gray')
+        color_active = pygame.Color('white')
+        color = color_active  # Set active color
+        font = pygame.font.Font(None, 32)
+
+        while input_active:
+            for event in pygame.event.get():
+                if event.type == QUIT:
+                    pygame.quit()
+                    sys.exit()
+                if event.type == KEYDOWN:
+                    if event.key == K_ESCAPE:
+                        pygame.quit()
+                        sys.exit()
+                    elif event.key == pygame.K_RETURN:
+                        # Enter key confirms the name
+                        if player_name:
+                            input_active = False
+                    elif event.key == pygame.K_BACKSPACE:
+                        # Remove the last character
+                        player_name = player_name[:-1]
+                    else:
+                        # Add typed character to the player name
+                        if len(player_name) < 15:  # Limit the length of the name
+                            player_name += event.unicode
+
+            # Draw input box and text
+            self.config.screen.fill((0, 0, 0))  # Clear screen with black color
+            txt_surface = font.render(player_name, True, color)
+            width = max(200, txt_surface.get_width() + 10)
+            input_box.w = width
+            self.config.screen.blit(txt_surface, (input_box.x + 5, input_box.y + 5))
+            pygame.draw.rect(self.config.screen, color, input_box, 2)
+
+            # Display instruction text
+            instruction_text = font.render("Type your name", True, (255, 255, 255))
+            self.config.screen.blit(instruction_text, (50, 150))
+
+            pygame.display.flip()
+            self.config.clock.tick(30)  # Control the input loop speed
+
+        self.player_name = player_name  # Set the name to the class attribute
+
     async def start(self):
+        # Get the player's name using the Pygame text input method
+        await self.get_player_name()
+
         while True:
             self.background = Background(self.config)
             self.floor = Floor(self.config)
@@ -84,9 +139,10 @@ class Flappy:
             self.player.tick()
             self.welcome_message.tick()
 
-            # Display FPS on the screen and expose it to Prometheus
+            # Display FPS and player name on the screen
             self.display_and_track_fps()
-            
+            self.display_player_name()
+
             # Check if it's time to measure network latency
             if time.time() - self.last_latency_check >= self.latency_check_interval:
                 asyncio.create_task(self.measure_network_latency())
@@ -100,21 +156,6 @@ class Flappy:
             pygame.display.update()
             await asyncio.sleep(0)
             self.config.tick()
-
-    def check_quit_event(self, event):
-        if event.type == QUIT or (
-            event.type == KEYDOWN and event.key == K_ESCAPE
-        ):
-            pygame.quit()
-            sys.exit()
-
-    def is_tap_event(self, event):
-        m_left, _, _ = pygame.mouse.get_pressed()
-        space_or_up = event.type == KEYDOWN and (
-            event.key == K_SPACE or event.key == K_UP
-        )
-        screen_tap = event.type == pygame.FINGERDOWN
-        return m_left or space_or_up or screen_tap
 
     async def play(self):
         self.score.reset()
@@ -139,8 +180,9 @@ class Flappy:
             self.score.tick()
             self.player.tick()
 
-            # Display FPS on the screen and expose it to Prometheus
+            # Display FPS and player name on the screen
             self.display_and_track_fps()
+            self.display_player_name()
 
             # Check if it's time to measure network latency
             if time.time() - self.last_latency_check >= self.latency_check_interval:
@@ -162,6 +204,7 @@ class Flappy:
         self.pipes.stop()
         self.floor.stop()
 
+        # Wait for the player to hit the floor and show game over screen
         while True:
             for event in pygame.event.get():
                 self.check_quit_event(event)
@@ -176,13 +219,37 @@ class Flappy:
             self.player.tick()
             self.game_over_message.tick()
 
-            # Display FPS on the screen and expose it to Prometheus
+            # Display FPS and player name on the screen
             self.display_and_track_fps()
+            self.display_player_name()
 
             self.config.tick()
             pygame.display.update()
             await asyncio.sleep(0)
 
+        # Call the function to send the score to Lambda
+        await self.send_score_to_lambda()
+
+    async def send_score_to_lambda(self):
+        """Send player score to Lambda function."""
+        # Construct the payload for Lambda function
+        payload = {
+            'user_id': self.player_name,  # Use player name or a unique user ID
+            'score': self.score.value      # Assuming 'self.score.value' holds the score
+        }
+
+        try:
+            # Invoke the Lambda function
+            response = self.lambda_client.invoke(
+                FunctionName='your-lambda-function-name',  # Replace with your actual Lambda function name
+                InvocationType='Event',  # Use 'Event' to run asynchronously
+                Payload=json.dumps(payload)
+            )
+
+            # Log the Lambda response
+            print(f"Lambda invocation response: {response}")
+        except Exception as e:
+            print(f"Failed to send score to Lambda: {e}")
     async def measure_network_latency(self):
         """Measure the network latency by sending a request to a specified endpoint."""
         url = "http://localhost:8000/metrics"  # Change this to your target URL
@@ -223,13 +290,19 @@ class Flappy:
     def display_and_track_fps(self):
         """Renders the FPS on the screen and exposes it to Prometheus."""
         fps = int(self.config.clock.get_fps())
-        fps_text = self.font.render(f"FPS: {fps}", True, (255, 255, 255))
-        self.config.screen.blit(fps_text, (10, 10))  # Display FPS at top-left corner
-        
-        # Expose FPS to Prometheus
-        self.fps_metric.set(fps)
+        fps_text = self.font.render(f'FPS: {fps}', True, (255, 255, 255))
+        self.config.screen.blit(fps_text, (5, 5))
+        self.fps_metric.set(fps)  # Update the FPS metric for Prometheus
 
-# Start the game
-if __name__ == "__main__":
-    flappy_game = Flappy()
-    asyncio.run(flappy_game.start())
+    def display_player_name(self):
+        """Displays the player's name on the screen."""
+        name_text = self.font.render(f'Player: {self.player_name}', True, (255, 255, 255))
+        self.config.screen.blit(name_text, (5, 25))
+
+    def is_tap_event(self, event):
+        return event.type == KEYDOWN and event.key in (K_SPACE, K_UP)
+
+    def check_quit_event(self, event):
+        if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
+            pygame.quit()
+            sys.exit()
